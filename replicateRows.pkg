@@ -1,0 +1,776 @@
+CREATE OR REPLACE PACKAGE replicateRows AS
+
+   PROCEDURE copy(p_top_table_name      VARCHAR2 := NULL,
+                  p_key_value           VARCHAR2 := NULL,
+				  p_dblink_val          VARCHAR2 := NULL,
+				  p_source_schema       VARCHAR2 := NULL,
+				  p_destination_schema  VARCHAR2 := NULL,
+				  p_execute             BOOLEAN  := FALSE,
+			      p_commit              BOOLEAN  := TRUE);
+
+
+   PROCEDURE createTrackingSequence;
+   
+   PROCEDURE disableFKConstraints(p_run_no NUMBER := NULL);
+   
+   PROCEDURE enableFKConstraints(p_run_no NUMBER := NULL);
+   
+   PROCEDURE executeRun(p_run_no  NUMBER  := NULL,
+                        p_commit  BOOLEAN := TRUE);
+   
+   PROCEDURE clearRun(p_run_no NUMBER := NULL);
+   
+   FUNCTION getCurrentRunNo RETURN NUMBER;
+
+END;
+/
+
+/*==========================================================================================================================================================================================================*/
+/*================================================================================= PACKAGE BODY ===========================================================================================================*/
+/*==========================================================================================================================================================================================================*/
+
+CREATE OR REPLACE PACKAGE BODY replicateRows AS
+
+ -- Each run needs a tracking number to store in log table.
+ pv_run_number NUMBER(12) := NULL;
+
+ -- These get set during the copy procedure
+ pv_source_schema VARCHAR2(70) := NULL;
+ pv_dest_schema   VARCHAR2(70) := NULL;
+ pv_dblink        VARCHAR2(70) := NULL;
+
+ pc_et_insert       VARCHAR2(6) := 'INSERT';
+ pc_et_update       VARCHAR2(6) := 'UPDATE';
+ pc_et_disable_fk   VARCHAR2(10) := 'DISABLE_FK';
+ pc_et_enable_fk    VARCHAR2(9) := 'ENABLE_FK';
+ pc_et_run_fail     VARCHAR2(8) := 'RUN_FAIL';
+
+ -- Used for Exception message posting.
+ pv_target_table    VARCHAR2(70) := NULL;
+ pv_parent_table    VARCHAR2(70) := NULL;
+
+/*===========================================================================================================*/
+
+PROCEDURE createTrackingSequence 
+IS
+
+   v_sql VARCHAR2(200) := 'CREATE SEQUENCE REPLICATE_TRK_SEQ';
+
+BEGIN
+
+  EXECUTE IMMEDIATE v_sql; 
+
+END;
+
+/*=========================================================================================================*/
+
+PROCEDURE setRunNumber
+IS
+BEGIN
+
+   pv_run_number := REPLICATE_TRK_SEQ.nextval;
+
+END;
+
+/*=========================================================================================================*/
+
+PROCEDURE addProcessEntry(p_parent_table VARCHAR2 := NULL,
+                          p_child_table  VARCHAR2 := NULL,
+						  p_entry_type   VARCHAR2 := NULL,
+					      p_statement    VARCHAR2 := NULL,
+						  p_message      VARCHAR2 := NULL)
+IS
+   PRAGMA AUTONOMOUS_TRANSACTION;
+
+   v_sql VARCHAR2(500) := 'INSERT INTO REPLICATION_PROCESSING(id,run_no,parent_table,child_table,entry_type,process_statement,process_msg,statement_hash) VALUES (REPLICATE_LOG_PK_SEQ.nextval,:1,:2,:3,:4,:5,:6,:7)';
+
+BEGIN
+
+  EXECUTE IMMEDIATE v_sql USING pv_run_number,p_parent_table,p_child_table,p_entry_type,p_statement,p_message,DBMS_CRYPTO.HASH(TO_CLOB(p_statement),1);
+
+  COMMIT;
+
+END;
+
+/*=========================================================================================================*/
+
+PROCEDURE disableTriggers(p_table_name VARCHAR2 := NULL)
+IS
+
+   v_sql VARCHAR2(500) := 'ALTER TABLE '||p_table_name||' DISABLE ALL TRIGGERS';
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql;
+
+END;
+
+/*=========================================================================================================*/
+
+PROCEDURE enableTriggers(p_table_name VARCHAR2 := NULL)
+IS
+
+   v_sql VARCHAR2(500) := 'ALTER TABLE '||p_table_name||' ENABLE ALL TRIGGERS';
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getSinglePKColName(p_table_name VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   v_sql VARCHAR2(200) := 'SELECT b.column_name FROM user_cons_columns b, user_constraints a where a.table_name = :1 and a.constraint_type = ''P'' and b.constraint_name = a.constraint_name';
+
+   v_col_name VARCHAR2(200) := NULL;
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql INTO v_col_name USING p_table_name;
+
+   RETURN v_col_name;
+
+END;
+
+
+/*=========================================================================================================*/
+
+FUNCTION getPKColNames(p_table_name VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   v_sql  VARCHAR2(200) := 'SELECT listagg(pk_col||'':''||data_type,'','') WITHIN GROUP (ORDER BY pk_col_id) pk_cols FROM SCHEMA_PK_COLS_MV WHERE table_name = :1 GROUP BY table_name';
+
+   v_col_names VARCHAR2(200) := NULL;
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql INTO v_col_names USING UPPER(p_table_name);
+
+   RETURN v_col_names;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getPKColNamesNoDataType(p_table_name VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   v_sql  VARCHAR2(200) := 'SELECT listagg(pk_col,'','') WITHIN GROUP (ORDER BY pk_col_id) pk_cols FROM SCHEMA_PK_COLS_MV WHERE table_name = :1 GROUP BY table_name';
+
+   v_col_names VARCHAR2(200) := NULL;
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql INTO v_col_names USING UPPER(p_table_name);
+
+   RETURN v_col_names;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getFKColNames(p_parent_table    VARCHAR2 := NULL,
+                       p_child_table     VARCHAR2 := NULL,
+					   p_constraint_name VARCHAR2) RETURN VARCHAR2
+IS
+
+   v_sql  VARCHAR2(500) := 'SELECT listagg(fk_col||'':''||fk_data_type,'','') WITHIN GROUP (ORDER BY fk_col_id) fk_cols FROM SCHEMA_RELATIONSHIPS_MV WHERE parent_table = :1 and child_table = :2 and constraint_name = :3 group by child_table';
+
+   v_col_names VARCHAR2(200) := NULL;
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql INTO v_col_names USING UPPER(p_parent_table),UPPER(p_child_table),UPPER(p_constraint_name);
+
+   RETURN v_col_names;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION createColValWhereString(p_cols        VARCHAR2 := NULL,
+                                 p_vals        VARCHAR2 := NULL,
+								 p_col_prefix  VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+
+   v_clause VARCHAR2(4000) := NULL;
+
+   v_col  VARCHAR2(70)  := NULL;
+   v_val  VARCHAR2(200) := NULL;
+   v_type VARCHAR2(70)  := NULL;
+
+BEGIN
+
+   FOR x IN 1 .. TEXT_TOKENIZE.getElementCount(p_cols,',') LOOP
+
+   	 v_col  := NULL;
+	 v_val  := NULL;
+	 v_type := NULL;
+
+     v_col  := TEXT_TOKENIZE.getStringElement(TEXT_TOKENIZE.getStringElement(p_cols,x),1,':');
+	 v_type := TEXT_TOKENIZE.getStringElement(TEXT_TOKENIZE.getStringElement(p_cols,x),2,':');
+	 v_val  := TEXT_TOKENIZE.getStringElement(p_vals,x);
+
+	 IF p_col_prefix IS NOT NULL THEN
+
+	    v_col := p_col_prefix||'.'||v_col;
+
+	 END IF;
+
+	 IF v_type IN ('CLOB','CHAR','VARCHAR2','DATE') THEN
+
+	    v_val := ''''||v_val||'''';
+
+	 END IF;
+
+     v_clause := v_clause||v_col||'='||v_val||' AND ';
+
+   END LOOP;
+
+   v_clause := SUBSTR(v_clause,1,INSTR(v_clause,' AND ',-1)-1);
+
+   RETURN v_clause;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION createUpdateColWhereString(p_cols_left    VARCHAR2 := NULL,
+                                    p_cols_right   VARCHAR2 := NULL,
+									p_left_prefix  VARCHAR2 := NULL,
+									p_right_prefix VARCHAR2 := NULL ) RETURN VARCHAR2
+IS
+
+   v_clause VARCHAR2(4000) := NULL;
+
+   v_col_left   VARCHAR2(200)  := NULL;
+   v_col_right  VARCHAR2(200) := NULL;
+
+BEGIN
+
+   FOR x IN 1 .. TEXT_TOKENIZE.getElementCount(p_cols_left,',') LOOP
+
+      v_col_left  := NULL;
+	  v_col_right := NULL;
+
+      v_col_left := TEXT_TOKENIZE.getStringElement(TEXT_TOKENIZE.getStringElement(p_cols_left,x),1,':');
+
+	  IF p_left_prefix IS NOT NULL THEN
+
+	     v_col_left := p_left_prefix||'.'||v_col_left;   
+
+	  END IF;
+
+      v_col_right := TEXT_TOKENIZE.getStringElement(TEXT_TOKENIZE.getStringElement(p_cols_right,x),1,':');
+
+	  IF p_right_prefix IS NOT NULL THEN
+
+	     v_col_right:= p_right_prefix||'.'||v_col_right;   
+
+	  END IF;
+
+	  v_clause := v_clause||v_col_left||'='||v_col_right||' AND ';
+
+   END LOOP;
+
+   v_clause := SUBSTR(v_clause,1,INSTR(v_clause,' AND ',-1)-1);
+
+   RETURN v_clause;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION existsSRCRecord(p_table   VARCHAR2 := NULL,
+                         p_key_val VARCHAR2 := NULL) RETURN BOOLEAN
+IS
+
+   v_pk_cols VARCHAR2(500) := NULL;
+
+   v_pk_clause VARCHAR2(500) := NULL;
+
+   v_sql VARCHAR2(1000) := 'SELECT count(''x'') FROM <TABLE> WHERE <PK>';
+
+   v_cnt NUMBER(3) := NULL;
+
+   v_return BOOLEAN := FALSE;
+
+BEGIN
+
+   v_pk_cols := getPKColNames(p_table);
+
+   v_pk_clause := createColValWhereString(v_pk_cols,p_key_Val);
+
+   v_sql := REPLACE(REPLACE(v_sql,'<TABLE>',p_table),'<PK>',v_pk_clause);
+   
+   --DBMS_OUTPUT.PUT_LINE(v_sql);
+
+   EXECUTE IMMEDIATE v_sql INTO v_cnt;
+
+   IF v_cnt > 0 THEN
+
+     v_return := TRUE;
+
+  END IF;
+
+  RETURN v_return;
+
+END;
+
+/*========================================================================================================*/
+
+FUNCTION createUpdateStatment(p_table_name  VARCHAR2 := NULL,
+                              p_key_vals    VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   CURSOR crsrCols(cv_table  VARCHAR2) IS
+   SELECT
+           'b.'||column_name||' = (select a.'||column_name||' from '||table_name||' a where <PKCOLS>)' set_stmt
+   FROM  
+           user_tab_columns
+   WHERE
+           table_name = cv_table
+   ORDER BY column_id asc;
+
+   v_set_stmt VARCHAR2(15000) := NULL;	
+
+   v_pk_cols    VARCHAR2(70) := NULL; 
+
+   v_pk_clause        VARCHAR2(500) := NULL;
+   v_pk_cols_clause   VARCHAR2(500) := NULL;
+
+   v_update_stmt VARCHAR2(32000) := 'UPDATE <DESTTABLE> b SET <COLS> WHERE <PK>';
+
+
+BEGIN
+
+   v_pk_cols := getPKColNames(p_table_name);
+
+   v_pk_clause := createColValWhereString(v_pk_cols,p_key_vals);
+
+   v_pk_cols_clause := createUpdateColWhereString(v_pk_cols,v_pk_cols,'a','b');
+
+   FOR data_rec IN crsrCols(p_table_name) LOOP
+
+      v_set_stmt := v_set_stmt||data_rec.set_stmt||',';
+
+   END LOOP;
+
+   v_set_stmt := RTRIM(v_set_stmt,',');
+
+   IF pv_dblink IS NOT NULL THEN
+
+      v_update_stmt := REPLACE(v_update_stmt,'<SRCTABLE>','<SRCTABLE>@'||pv_dblink);
+
+   END IF;
+
+
+   IF pv_source_schema IS NOT NULL THEN
+
+      v_update_stmt := REPLACE(v_update_stmt,'<SRCTABLE>',pv_source_schema||'.<SRCTABLE>');
+
+   END IF;
+
+   IF pv_dest_schema IS NOT NULL THEN
+
+      v_update_stmt := REPLACE(v_update_stmt,'<DESTTABLE>',pv_dest_schema||'.<DESTTABLE>');
+
+   END IF; 
+
+   v_update_stmt := REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(v_update_stmt,'<SRCTABLE>',p_table_name),'<DESTTABLE>',p_table_name),'<PK>',v_pk_clause),'<COLS>',v_set_stmt),'<PKCOLS>',v_pk_cols_clause);
+
+   RETURN v_update_stmt;
+
+END;
+
+/*========================================================================================================*/
+FUNCTION existsStatement(p_run_no    NUMBER   := NULL,
+                         p_statement VARCHAR2 := NULL) RETURN BOOLEAN
+IS
+
+  v_sql VARCHAR2(100) := 'SELECT count(''x'') FROM replication_processing WHERE run_no = :1 AND statement_hash=:2';
+
+  v_cnt NUMBER(5) := 0;
+
+  v_return BOOLEAN := FALSE;
+
+  v_statement CLOB := p_statement;
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql INTO v_cnt USING p_run_no,DBMS_CRYPTO.HASH(v_statement,1);
+
+   IF v_cnt > 0 THEN
+
+      v_return := TRUE;
+
+   END IF;
+
+   RETURN v_return;
+
+END;
+
+/*========================================================================================================*/
+
+PROCEDURE pushRecord(p_target  VARCHAR2 := NULL,
+                     p_key_val VARCHAR2 := NULL,
+					 p_parent  VARCHAR2 := NULL)
+IS
+
+   TYPE cursorType IS REF CURSOR;
+   v_Cursor  cursorType;
+
+   CURSOR crsrChildren(cv_parent VARCHAR2) IS
+   SELECT  DISTINCT
+           child_table,
+		   constraint_name
+   FROM
+           SCHEMA_RELATIONSHIPS_MV
+   WHERE
+           parent_table = cv_parent
+   AND     child_table IS NOT NULL;
+
+
+   v_target_statement VARCHAR2(32000) := 'INSERT INTO <DESTTABLE> SELECT * FROM <SRCTABLE> WHERE <PKCOL>';
+
+   v_rc_base VARCHAR2(1000) := 'SELECT <PK> pkval FROM <TABLE> WHERE <FKCOL>';
+
+   v_rc_statement VARCHAR2(1000) := NULL;
+
+   v_pk_col_string VARCHAR2(100) := NULL;
+
+   v_child_pk_vals VARCHAR2(100) := NULL;
+
+   v_fk_clause VARCHAR2(200) := NULL;
+
+   v_pk_clause VARCHAR2(200) := NULL;
+
+BEGIN
+
+   IF pv_dblink IS NOT NULL THEN
+      v_target_statement := REPLACE(v_target_statement,'<SRCTABLE>','<SRCTABLE>@'||pv_dblink);
+	  v_rc_base := REPLACE(v_rc_base,'<TABLE>','<TABLE>@'||pv_dblink);
+   END IF;
+
+   IF pv_source_schema IS NOT NULL THEN
+
+      v_target_statement := REPLACE(v_target_statement,'<SRCTABLE>',pv_source_schema||'.<SRCTABLE>');
+	  v_rc_base := REPLACE(v_rc_base,'<TABLE>',pv_source_schema||'.<TABLE>');
+
+   END IF;
+
+   IF pv_dest_schema IS NOT NULL THEN
+
+      v_target_statement := REPLACE(v_target_statement,'<DESTTABLE>',pv_dest_schema||'.<DESTTABLE>');
+
+   END IF;
+
+   v_pk_clause := createColValWhereString(getPKColNames(p_target),p_key_val);
+
+   v_target_statement := REPLACE(REPLACE(REPLACE(v_target_statement,'<DESTTABLE>',p_target),'<SRCTABLE>',p_target),'<PKCOL>',v_pk_clause);
+
+
+
+   IF NOT existsSRCRecord(p_target,p_key_val) THEN
+
+      IF NOT existsStatement(pv_run_number,v_target_statement) THEN
+
+          addProcessEntry(p_parent_table => p_parent,
+                          p_child_table  => p_target,
+					      p_entry_type   => PC_ET_INSERT,
+					      p_statement    => v_target_statement,
+					      p_message      => 'NOT APPLIED');
+
+	  END IF;
+
+    ELSE
+
+       v_target_statement := createUpdateStatment(p_target,p_key_val);
+
+      IF NOT existsStatement(pv_run_number,v_target_statement) THEN
+
+          addProcessEntry(p_parent_table => p_parent,
+                          p_child_table  => p_target,
+					      p_entry_type   => PC_ET_UPDATE,
+					      p_statement    => v_target_statement,
+					      p_message      => 'NOT APPLIED');
+
+	  END IF;
+
+   END IF;
+
+   FOR data_rec IN crsrChildren(p_target) LOOP
+      -- Get fk col name from child
+
+	  v_pk_col_string := REPLACE(getPKColNamesNoDataType(data_rec.child_table),',','||'',''||');
+
+	  v_fk_clause := createColValWhereString(getFKColNames(p_target,data_rec.child_table,data_rec.constraint_name),p_key_val);
+
+	  v_rc_statement := REPLACE(REPLACE(REPLACE(v_rc_base,'<PK>',v_pk_col_string),'<FKCOL>',v_fk_clause),'<TABLE>',data_rec.child_table);
+
+	  OPEN v_cursor FOR v_rc_statement;
+
+      LOOP 
+		FETCH  v_cursor INTO v_child_pk_vals;
+
+        EXIT WHEN v_cursor%NOTFOUND;
+
+		pushRecord(p_target  => data_rec.child_table,
+                   p_key_val => v_child_pk_vals,
+				   p_parent  => p_target);
+
+      END LOOP;
+
+   END LOOP;
+
+/*EXCEPTION
+  WHEN OTHERS THEN
+     addProcessEntry(p_parent_table => p_parent,
+                     p_child_table  => p_target,
+					 p_entry_type   => PC_ET_RUN_FAIL,
+					 p_statement    => NULL,
+					 p_message      => SQLERRM); 
+	 RAISE;*/
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE disableFKConstraints(p_run_no NUMBER := NULL) 
+IS
+
+   CURSOR crsrConstraints(cv_run_no NUMBER) IS
+   SELECT distinct
+          rp.child_table,
+          srm.constraint_name,
+		  'ALTER TABLE '||rp.child_table||' DISABLE CONSTRAINT '||srm.constraint_name stmt
+   FROM
+         SCHEMA_RELATIONSHIPS_MV srm,
+         REPLICATION_PROCESSING rp
+   WHERE
+          rp.run_no = cv_run_no
+    AND   srm.child_table = rp.child_table
+    AND   srm.constraint_name IS NOT NULL
+   ORDER BY 1 ASC;
+
+BEGIN
+
+  FOR data_rec IN crsrConstraints(p_run_no) LOOP
+
+     EXECUTE IMMEDIATE data_rec.stmt;
+
+  END LOOP;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE enableFKConstraints(p_run_no NUMBER := NULL) 
+IS
+
+   CURSOR crsrConstraints(cv_run_no NUMBER) IS
+   SELECT distinct
+          rp.child_table,
+          srm.constraint_name,
+		  'ALTER TABLE '||rp.child_table||' ENABLE NOVALIDATE CONSTRAINT '||srm.constraint_name stmt
+   FROM
+         SCHEMA_RELATIONSHIPS_MV srm,
+         REPLICATION_PROCESSING rp
+   WHERE
+           rp.run_no = cv_run_no
+    AND   srm.child_table = rp.child_table
+    AND   srm.constraint_name IS NOT NULL
+   ORDER BY 1 ASC;
+
+BEGIN
+
+  FOR data_rec IN crsrConstraints(p_run_no) LOOP
+
+     EXECUTE IMMEDIATE data_rec.stmt;
+
+  END LOOP;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE executeStatement(p_table_name  VARCHAR2 := NULL,
+                           p_statement   CLOB := NULL)
+IS
+BEGIN
+
+   disableTriggers(p_table_name);
+
+   EXECUTE IMMEDIATE p_statement;
+
+   enableTriggers(p_table_name);
+
+EXCEPTION WHEN OTHERS THEN
+  enableTriggers(p_table_name);
+  RAISE;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE updateProcessRecord(p_id      NUMBER   := NULL,
+                              p_status  VARCHAR2 := NULL,
+							  p_message VARCHAR2 := NULL)
+IS
+
+   PRAGMA AUTONOMOUS_TRANSACTION;
+
+   v_sql VARCHAR2(500) := 'UPDATE replication_processing SET process_msg = :1 WHERE id = :2';
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql USING RTRIM(p_status||' - '||p_message,' - '),p_id;
+
+   COMMIT;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE executeRun(p_run_no NUMBER  := NULL,
+                     p_commit BOOLEAN := TRUE)
+IS
+
+   CURSOR crsrStatements(cv_run_no NUMBER) IS
+   SELECT
+           id,
+		   child_table,
+		   process_statement
+   FROM
+           replication_processing
+   WHERE
+           run_no = cv_run_no
+   AND     process_msg = 'NOT APPLIED'
+   ORDER BY id ASC;
+
+BEGIN
+
+  disableFKConstraints(p_run_no);
+
+  FOR data_rec IN crsrStatements(p_run_no) LOOP
+
+     BEGIN
+
+        executeStatement(data_rec.child_table,data_rec.process_statement);
+		updateProcessRecord(data_rec.id,'APPLIED');
+
+	 EXCEPTION
+	    WHEN OTHERS THEN
+	    updateProcessRecord(data_rec.id,'ERROR',SQLERRM);
+		RAISE;
+
+	 END;
+
+  END LOOP;
+
+  enableFKConstraints(p_run_no);
+
+  IF p_commit THEN
+
+     COMMIT;
+
+  END IF;
+
+EXCEPTION
+   WHEN OTHERS THEN
+      ROLLBACK;
+	  enableFKConstraints(p_run_no);
+	  RAISE;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE clearRun(p_run_no NUMBER := NULL)
+IS
+
+   PRAGMA AUTONOMOUS_TRANSACTION;
+
+   v_sql VARCHAR2(500) := 'DELETE FROM replication_processing WHERE run_no=:1';
+
+BEGIN
+
+   EXECUTE IMMEDIATE v_sql USING p_run_no;
+
+   COMMIT;
+
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+	 NULL;
+
+END;
+
+/*=========================================================================================================================*/
+
+FUNCTION getCurrentRunNo RETURN NUMBER
+IS
+BEGIN
+
+   RETURN pv_run_number;
+
+END;
+
+/*=========================================================================================================================*/
+
+PROCEDURE copy(p_top_table_name      VARCHAR2 := NULL,
+               p_key_value           VARCHAR2 := NULL,
+			   p_dblink_val          VARCHAR2 := NULL,
+			   p_source_schema       VARCHAR2 := NULL,
+			   p_destination_schema  VARCHAR2 := NULL,
+			   p_execute             BOOLEAN  := FALSE,
+			   p_commit              BOOLEAN  := TRUE)
+IS
+BEGIN
+
+    pv_dblink := p_dblink_val;
+    pv_source_schema := p_source_schema;
+    pv_dest_schema := p_destination_schema;
+
+	setRunNumber;
+
+    pushRecord(p_target  => p_top_table_name,
+               p_key_val => p_key_value,
+			   p_parent  => p_top_table_name);   
+
+
+    IF p_execute THEN
+
+	   executeRun(pv_run_number,p_commit);
+
+	END IF; 
+
+END;
+
+/*-------------*/
+/* END PACKAGE */
+/*-------------*/
+END;
+/
+
+/*
+
+BEGIN
+
+   EXECUTE IMMEDIATE 'TRUNCATE TABLE REPLICATION_PROCESSING';
+
+   replicateRows.copy(p_top_table_name      => 'INCIDENTS',
+                      p_key_value           => '4807704',
+				      p_dblink_val          => 'RMSPROD.WORLD',
+				      p_source_schema       => 'KBCOPSDO',
+				      p_destination_schema  => 'KBCOPSDO',
+				      p_execute             => FALSE,
+					  p_commit              => FALSE);
+
+
+END;
+
+*/
